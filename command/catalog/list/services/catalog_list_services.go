@@ -1,16 +1,15 @@
 package services
 
 import (
-	"bytes"
 	"flag"
 	"fmt"
 	"sort"
 	"strings"
-	"text/tabwriter"
 
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/command/flags"
 	"github.com/mitchellh/cli"
+	"github.com/ryanuber/columnize"
 )
 
 func New(ui cli.Ui) *cmd {
@@ -26,9 +25,10 @@ type cmd struct {
 	help  string
 
 	// flags
-	node     string
-	nodeMeta map[string]string
-	tags     bool
+	node        string
+	nodeMeta    map[string]string
+	tags        []string
+	serviceName string
 }
 
 func (c *cmd) init() {
@@ -40,8 +40,9 @@ func (c *cmd) init() {
 		"services running on nodes matching the given metadata will be returned. "+
 		"This flag may be specified multiple times to filter on multiple sources "+
 		"of metadata.")
-	c.flags.BoolVar(&c.tags, "tags", false, "Display each service's tags as a "+
-		"comma-separated list beside each service entry.")
+	c.flags.StringVar(&c.serviceName, "service", "",
+		"Service `id or name` to list entries.")
+	c.flags.Var((*flags.CommaSliceValue)(&c.tags), "tags", "Tags to filter services.")
 
 	c.http = &flags.HTTPFlags{}
 	flags.Merge(c.flags, c.http.ClientFlags())
@@ -67,28 +68,67 @@ func (c *cmd) Run(args []string) int {
 		return 1
 	}
 
-	var services map[string][]string
+	queryOptions := &api.QueryOptions{
+		NodeMeta: c.nodeMeta,
+	}
+
+	var services map[string][]service
+
 	if c.node != "" {
-		catalogNode, _, err := client.Catalog().Node(c.node, &api.QueryOptions{
-			NodeMeta: c.nodeMeta,
-		})
+		catalogNode, _, err := client.Catalog().Node(c.node, queryOptions)
 		if err != nil {
 			c.UI.Error(fmt.Sprintf("Error listing services for node: %s", err))
 			return 1
 		}
+
 		if catalogNode != nil {
-			services = make(map[string][]string, len(catalogNode.Services))
+			services = make(map[string][]service, len(catalogNode.Services))
 			for _, s := range catalogNode.Services {
-				services[s.Service] = append(services[s.Service], s.Tags...)
+				if c.serviceName != "" && s.Service != c.serviceName {
+					continue
+				}
+
+				if isSubset(s.Tags, c.tags) {
+					services[s.Service] = append(services[s.Service], service{
+						addr: s.Address,
+						id:   s.ID,
+						node: catalogNode.Node.Node,
+						tags: s.Tags,
+					})
+				}
 			}
 		}
 	} else {
-		services, _, err = client.Catalog().Services(&api.QueryOptions{
-			NodeMeta: c.nodeMeta,
-		})
+		catalogServices, _, err := client.Catalog().Services(queryOptions)
 		if err != nil {
 			c.UI.Error(fmt.Sprintf("Error listing services: %s", err))
 			return 1
+		}
+
+		if len(catalogServices) > 0 {
+			services = make(map[string][]service, len(catalogServices))
+			for serviceName := range catalogServices {
+				if c.serviceName != "" && serviceName != c.serviceName {
+					continue
+				}
+
+				svcs, _, err := client.Catalog().Service(serviceName, "", queryOptions)
+				if err != nil {
+					c.UI.Error(fmt.Sprintf("Error listing services for %s: %s", serviceName, err))
+					return 1
+				}
+
+				for _, svc := range svcs {
+					if isSubset(svc.ServiceTags, c.tags) {
+						services[serviceName] = append(services[serviceName], service{
+							addr: svc.Address,
+							id:   svc.ID,
+							node: svc.Node,
+							tags: svc.ServiceTags,
+						})
+					}
+				}
+			}
 		}
 	}
 
@@ -98,31 +138,7 @@ func (c *cmd) Run(args []string) int {
 		return 0
 	}
 
-	// Order the map for consistent output
-	order := make([]string, 0, len(services))
-	for k := range services {
-		order = append(order, k)
-	}
-	sort.Strings(order)
-
-	if c.tags {
-		var b bytes.Buffer
-		tw := tabwriter.NewWriter(&b, 0, 2, 6, ' ', 0)
-		for _, s := range order {
-			sort.Strings(services[s])
-			fmt.Fprintf(tw, "%s\t%s\n", s, strings.Join(services[s], ","))
-		}
-		if err := tw.Flush(); err != nil {
-			c.UI.Error(fmt.Sprintf("Error flushing tabwriter: %s", err))
-			return 1
-		}
-		c.UI.Output(strings.TrimSpace(b.String()))
-	} else {
-		for _, s := range order {
-			c.UI.Output(s)
-		}
-	}
-
+	c.UI.Info(printServices(services))
 	return 0
 }
 
@@ -161,3 +177,72 @@ Usage: consul catalog services [options]
   For a full list of options and examples, please see the Consul documentation.
 `
 )
+
+type service struct {
+	addr string
+	id   string
+	node string
+	tags []string
+}
+
+type byAddr []service
+
+func (b byAddr) Len() int {
+	return len(b)
+}
+
+func (b byAddr) Less(i, j int) bool {
+	return b[i].addr < b[j].addr
+}
+
+func (b byAddr) Swap(i, j int) {
+	b[i], b[j] = b[j], b[i]
+}
+
+func isSubset(set, subSet []string) bool {
+	if len(subSet) == 0 {
+		return true
+	}
+
+loop:
+	for _, subElement := range subSet {
+		for _, element := range set {
+			if element == subElement {
+				continue loop
+			}
+		}
+		return false
+	}
+
+	return true
+}
+
+func printServices(services map[string][]service) string {
+	// Order the map for consistent output
+	order := make([]string, 0, len(services))
+	for k := range services {
+		order = append(order, k)
+	}
+	sort.Strings(order)
+
+	result := make([]string, 0, len(services)+1)
+	header := "Service\x1fID\x1fAddress\x1fNode\x1fTags"
+	result = append(result, header)
+
+	for _, serviceName := range order {
+		sort.Sort(byAddr(services[serviceName]))
+
+		for _, svc := range services[serviceName] {
+			result = append(result, fmt.Sprintf("%s\x1f%s\x1f%s\x1f%s\x1f%s",
+				serviceName,
+				svc.id,
+				svc.addr,
+				svc.node,
+				strings.Join(svc.tags, ", "),
+			))
+		}
+
+	}
+
+	return columnize.Format(result, &columnize.Config{Delim: string([]byte{0x1f})})
+}
